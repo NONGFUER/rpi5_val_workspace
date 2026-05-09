@@ -1,28 +1,25 @@
 /**
  * ============================================================================
  * @file    modbus_poll_weight.c
- * @brief   Modbus RTU 轮询读取万工称重传感器 HX711 全部参数
+ * @brief   Modbus RTU 轮询读取费工称重终端净重及状态
  *
  * 功能说明：
- *   通过 RS485 串口，以 Modbus RTU 功能码0x03一次性读取从站全部参数。
- *   从站返回16字节数据，按小端序(LE)解析为以下5个字段：
+ *   通过 UART 串口，以 Modbus RTU 功能码 0x03 读取从站净重和状态。
+ *   从站返回 6 字节数据，解析为以下字段：
  *
  *     偏移  字节数  类型        字段名              打印格式示例
- *     +0     4      int32 LE    ADC Value           0x0835601
- *     +4     4      int32 LE    EmptyLoad_Value     0x0800601
- *     +8     4      float LE    SCALE1              214.5263
- *    +12     2      int16 LE    WEIGHT               125
- *    +14     2      uint16 LE   ContAndStatus       0x0003
+ *     +0     4      int32 BE    Net_Weight          -12345 (单位:g)
+ *     +4     2      uint16     Status_Word         0x0001
  *
- * 实际响应帧示例（原始字节）：
- *   TX: 01 03 00 10 00 08 CRC CRC
- *   RX: 01 03 10 01 56 83 00 01 06 80 00 BC 86 56 43 00 7D 00 03 AF 1A
- *                     |--ADC(LE)-| |--Empty(LE)-| |-SCALE1(LE)-| |WGT| |STS|
+ * 通讯报文示例：
+ *   TX: 01 03 00 00 00 03 05 CB          (从0x0000起读3个寄存器)
+ *   RX: 01 03 06 [Net_H] [Net_L] [Status] CRC_L CRC_H
  *
- * 通信参数：4800bps 8N1, 从站地址 0x01, 轮询间隔 1s/次
+ * 通信参数：9600bps 8N1, 从站地址 0x01, 轮询间隔 1s/次
  * 编译： gcc -Wall -Wextra -o modbus_poll_weight modbus_poll_weight.c
  * 运行： sudo ./modbus_poll_weight [/dev/ttyAMA0]   Ctrl+C 退出
  *
+ * 协议参考: mobus2.md (费工电子秤 Modbus RTU V1.1)
  * @author  AI Assistant
  * @date    2026-05-06
  * ============================================================================
@@ -127,19 +124,16 @@ static float le_to_float(const uint8_t *p) {
     return val;
 }
 
-/* ======================== 寄存器与常量定义 ======================== */
+/* ======================== 寄存器与常量定义 (费工协议 V1.1) ======================== */
 #define SLAVE_ADDR       0x01    /**< 从站地址 */
 #define FUNC_READ_HOLD   0x03    /**< 功能码: 读保持寄存器 */
-#define REG_START_ADDR   0x0010  /**< 起始寄存器地址 (ADC Value) */
-#define REG_TOTAL_COUNT  8       /**< 总共读取 8 个保持寄存器 (16字节) */
-/**< 8个寄存器 × 2字节 = 16B: 4+4+4+2+2 = ADC+Empty+SCALE1+WEIGHT+STATUS */
+#define REG_START_ADDR   0x0000  /**< 起始寄存器地址 (Net_Weight_H) */
+#define REG_TOTAL_COUNT  3       /**< 读取 3 个保持寄存器: Net_Weight(2) + Status_Word(1) */
+/**< 3个寄存器 × 2字节 = 6B: Net_Weight_H + Net_Weight_L + Status_Word */
 
-/** @brief 各字段在响应数据区中的字节偏移量 */
-#define OFFS_ADC_VALUE         0   /* [+0]  ADC原始值      4B int32 LE */
-#define OFFS_EMPTYLOAD_VALUE   4   /* [+4]  去皮值          4B int32 LE */
-#define OFFS_SCALE1            8   /* [+8]  校准系数        4B float  LE */
-#define OFFS_WEIGHT            12  /* [+12] 实时重量        2B int16 LE */
-#define OFFS_CONT_AND_STATUS   14  /* [+14] 状态标志        2B uint16 LE */
+/** @brief 各字段在响应数据区中的字节偏移量 (从 rx[3] 数据区起始) */
+#define OFFS_NET_WEIGHT        0   /* [+0]  净重值      4B int32 (大端序, 单位:g) */
+#define OFFS_STATUS_WORD       4   /* [+4]  状态字      2B uint16 */
 
 /* ======================== 信号处理 ======================== */
 static void on_sigint(int sig) { (void)sig; g_run = 0; }
