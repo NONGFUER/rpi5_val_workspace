@@ -1,7 +1,7 @@
 /**
  * ============================================================================
  * @file    modbus_poll_weight.c
- * @brief   Modbus RTU 轮询读取费工称重终端净重及状态
+ * @brief   Modbus RTU 轮询读取万工称重终端净重及状态
  *
  * 功能说明：
  *   通过 UART 串口，以 Modbus RTU 功能码 0x03 读取从站净重和状态。
@@ -19,7 +19,7 @@
  * 编译： gcc -Wall -Wextra -o modbus_poll_weight modbus_poll_weight.c
  * 运行： sudo ./modbus_poll_weight [/dev/ttyAMA0]   Ctrl+C 退出
  *
- * 协议参考: mobus2.md (费工电子秤 Modbus RTU V1.1)
+ * 协议参考: mobus2.md (万工电子秤 Modbus RTU V1.1)
  * @author  AI Assistant
  * @date    2026-05-06
  * ============================================================================
@@ -29,6 +29,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
 #include <fcntl.h>
 #include <termios.h>
 #include <stdint.h>
@@ -124,16 +125,19 @@ static float le_to_float(const uint8_t *p) {
     return val;
 }
 
-/* ======================== 寄存器与常量定义 (费工协议 V1.1) ======================== */
+/* ======================== 寄存器与常量定义 (万工 V1.1 协议) ======================== */
 #define SLAVE_ADDR       0x01    /**< 从站地址 */
 #define FUNC_READ_HOLD   0x03    /**< 功能码: 读保持寄存器 */
-#define REG_START_ADDR   0x0000  /**< 起始寄存器地址 (Net_Weight_H) */
-#define REG_TOTAL_COUNT  3       /**< 读取 3 个保持寄存器: Net_Weight(2) + Status_Word(1) */
-/**< 3个寄存器 × 2字节 = 6B: Net_Weight_H + Net_Weight_L + Status_Word */
+#define REG_START_ADDR   0x0010  /**< 起始寄存器地址 (HX711 ADC_Value) */
+#define REG_TOTAL_COUNT  8       /**< 读取 8 个保持寄存器 = 16字节 */
+/**< 8个寄存器 × 2字节 = 16B: ADC(4) + EmptyLoad(4) + SCALE1(4) + WEIGHT(2) + Status(2) */
 
-/** @brief 各字段在响应数据区中的字节偏移量 (从 rx[3] 数据区起始) */
-#define OFFS_NET_WEIGHT        0   /* [+0]  净重值      4B int32 (大端序, 单位:g) */
-#define OFFS_STATUS_WORD       4   /* [+4]  状态字      2B uint16 */
+/** @brief 各字段在响应数据区中的字节偏移量 (从 rx[3] 数据区起始, HX711全参数) */
+#define OFFS_ADC_VALUE         0   /* [+0]  ADC原始值    4B int32  小端序 */
+#define OFFS_EMPTYLOAD_VALUE   4   /* [+4]  去皮值      4B int32  小端序 */
+#define OFFS_SCALE1            8   /* [+8]  校准系数    4B float  小端序 IEEE754 */
+#define OFFS_WEIGHT            12  /* [+12] 实时重量    2B int16  大端序 (单位:g) */
+#define OFFS_CONT_AND_STATUS   14  /* [+14] 控制与状态  2B uint16 大端序 */
 
 /* ======================== 信号处理 ======================== */
 static void on_sigint(int sig) { (void)sig; g_run = 0; }
@@ -146,8 +150,8 @@ static int uart_init(const char *dev_path) {
     struct termios cfg = {0};
     tcgetattr(fd, &cfg);
 
-    cfsetispeed(&cfg, B4800);
-    cfsetospeed(&cfg, B4800);
+    cfsetispeed(&cfg, B9600);//
+    cfsetospeed(&cfg, B9600);//
 
     cfg.c_cflag &= ~(PARENB | CSTOPB | CSIZE | CRTSCTS);  /* 无校验、1停止位、清大小、无流控 */
     cfg.c_cflag |= CS8 | CREAD | CLOCAL;                   /* 8数据位、允许读、忽略DCD */
@@ -156,7 +160,7 @@ static int uart_init(const char *dev_path) {
     cfg.c_oflag &= ~OPOST;
     cfg.c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG);                  /* RAW模式、无回显 */
     cfg.c_cc[VMIN]  = 0;
-    cfg.c_cc[VTIME] = 0;
+    cfg.c_cc[VTIME] = 2;   /* 超时 2×100ms=200ms, 防止 read() 提前返回截断帧 */
 
     if (tcsetattr(fd, TCSANOW, &cfg) != 0) { perror("tcsetattr"); close(fd); return -1; }
     tcflush(fd, TCIOFLUSH);
@@ -197,17 +201,33 @@ static int modbus_read_all_params(int fd,
     memcpy(tx_buf, tx, sizeof(tx));
     *tx_len = sizeof(tx);
 
+    /* ---- 清空接收缓冲区 (丢弃上一轮残留/垃圾数据) ---- */
+    tcflush(fd, TCIFLUSH);
+
     /* ---- 发送 ---- */
     ssize_t wlen = write(fd, tx, sizeof(tx));
     if (wlen != (ssize_t)sizeof(tx))
         fprintf(stderr, "[WARN] write: expected %zd, got %zd\n", sizeof(tx), wlen);
     fsync(fd);
 
-    /* ---- 等待响应 (100ms余量) ---- */
-    usleep(100000);
+    /* ---- 循环读取: 收满 21 字节 或 超时 ---- */
+#define EXPECTED_RX_LEN  21   /* 01 03 10 [16B data] CRC CRC */
 
     memset(rx_buf, 0, 256);
-    *rx_len = (int)read(fd, rx_buf, 255);
+    int total = 0;
+    int retry = 0;
+    const int max_retry = 50;        /* 最多读50次 × ~200ms(VTIME) ≈ 10s 超时 */
+
+    while (total < EXPECTED_RX_LEN && retry < max_retry) {
+        ssize_t n = read(fd, rx_buf + total, EXPECTED_RX_LEN - total);
+        if (n > 0) {
+            total += n;
+        }
+        retry++;
+        if (n <= 0) usleep(20000);  /* 无数据时小等20ms再试 */
+    }
+
+    *rx_len = total;
     if (*rx_len <= 0) return -1;
 
     /* ---- CRC校验 ---- */
@@ -235,7 +255,7 @@ int main(int argc, char **argv) {
 
     printf("========================================\n");
     printf("  Modbus RTU -> HX711 全参数轮询\n");
-    printf("  串口: %s  @ 4800bps 8N1\n", uart_dev);
+    printf("  串口: %s  @ 9600bps 8N1\n", uart_dev);
     printf("  从站: 0x%02X | 读%d reg(16B) | 1s/轮\n",
            SLAVE_ADDR, REG_TOTAL_COUNT);
     printf("========================================\n\n");
