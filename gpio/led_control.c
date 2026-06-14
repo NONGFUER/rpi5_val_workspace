@@ -8,12 +8,12 @@
 #include <signal.h>
 #include <gpiod.h>
 
-#define PIN_GREEN 27
-#define PIN_BLUE  22
+#define PIN_GREEN 22
+#define PIN_BLUE  27
 #define PIN_RED   17
 #define CHECK_INTERVAL_SEC 3
 
-static const char *NETWORK_IFACES[] = { "wlan0", "usb0" };
+static const char *NETWORK_IFACES[] = { "wlan0", "usb0","eth1" };
 static const int NUM_IFACES = sizeof(NETWORK_IFACES) / sizeof(NETWORK_IFACES[0]);
 
 // v2: 使用 gpiod_line_request 替代 gpiod_line
@@ -62,16 +62,18 @@ void sigint_handler(int sig) {
 }
 
 void* run_led_thread(void* arg) {
-    /* 绿灯：运行指示，程序启动后常亮（低电平=亮） */
-    if (req_green) gpiod_line_request_set_value(req_green, PIN_GREEN, 0);
-    while (keep_running) { sleep(1); }
+    /* 绿灯：运行指示，500ms亮 / 500ms灭 */
+    while (keep_running) {
+        if (req_green) gpiod_line_request_set_value(req_green, PIN_GREEN, 0);  /* 低电平=亮 */
+        usleep(500000);
+        if (!keep_running) break;
+        if (req_green) gpiod_line_request_set_value(req_green, PIN_GREEN, 1);  /* 高电平=灭 */
+        usleep(500000);
+    }
     return NULL;
 }
 
 void* signal_led_thread(void* arg) {
-    int period_us = 20000;   /* 20ms 周期，50Hz PWM，肉眼可见呼吸 */
-    int duty = 0, step = 1;
-
     while (keep_running) {
         if (!req_blue) { usleep(100000); continue; }
 
@@ -79,19 +81,12 @@ void* signal_led_thread(void* arg) {
             gpiod_line_request_set_value(req_blue, PIN_BLUE, 0);  /* 低电平常亮 */
             usleep(100000);
         } else {
-            int on_time = (duty * period_us) / 100;
-            int off_time = period_us - on_time;
-            if (on_time > 0) {
-                gpiod_line_request_set_value(req_blue, PIN_BLUE, 0);  /* 低电平=亮 */
-                usleep(on_time);
-            }
-            if (off_time > 0) {
-                gpiod_line_request_set_value(req_blue, PIN_BLUE, 1);  /* 高电平=灭 */
-                usleep(off_time);
-            }
-            duty += step;
-            if (duty >= 100) { duty = 100; step = -1; }
-            else if (duty <= 0) { duty = 0; step = 1; }
+            /* 无信号：200ms亮 / 800ms灭 */
+            gpiod_line_request_set_value(req_blue, PIN_BLUE, 0);  /* 低电平=亮 */
+            usleep(200000);
+            if (!keep_running) break;
+            gpiod_line_request_set_value(req_blue, PIN_BLUE, 1);  /* 高电平=灭 */
+            usleep(800000);
         }
     }
     return NULL;
